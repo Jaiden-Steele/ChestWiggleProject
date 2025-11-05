@@ -4,33 +4,42 @@
 // Create MPU6050 object
 MPU6050 mpu;
 
-void setup() {
-  // Start I2C communication
-  Wire.begin();
+// Optional: track time in milliseconds
+unsigned long lastTime = 0;
+const int interval = 10; // 10 ms => ~100 Hz
 
-  // Start serial communication at 115200 baud
+void setup() {
+  Wire.begin();
   Serial.begin(115200);
 
-  // Initialize MPU6050
   mpu.initialize();
   if (mpu.testConnection()) {
     Serial.println("MPU6050 connected!");
   } else {
     Serial.println("MPU6050 connection failed!");
   }
+
+  // Optional: header for CSV
+  Serial.println("Time_ms,Ax,Ay,Az,Magnitude");
 }
 
 void loop() {
-  int16_t ax, ay, az;
+  unsigned long currentTime = millis();
+  if (currentTime - lastTime >= interval) {
+    lastTime = currentTime;
 
-  // Read raw acceleration data
-  mpu.getAcceleration(&ax, &ay, &az);
+    int16_t ax, ay, az;
+    mpu.getAcceleration(&ax, &ay, &az);
 
-  // Print data as CSV: Ax,Ay,Az
-  Serial.print(ax); Serial.print(",");
-  Serial.print(ay); Serial.print(",");
-  Serial.println(az);
+    // Compute magnitude
+    float magnitude = sqrt((long)ax * ax + (long)ay * ay + (long)az * az);
 
-  // Short delay to control sampling rate (~100 Hz)
-  delay(10);
+    // Print CSV: Time, Ax, Ay, Az, Magnitude
+    Serial.print(currentTime); Serial.print(",");
+    Serial.print(ax); Serial.print(",");
+    Serial.print(ay); Serial.print(",");
+    Serial.print(az); Serial.print(",");
+    Serial.println(magnitude);
+  }
 }
+
