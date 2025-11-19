@@ -1,6 +1,5 @@
 # HFOV Chest Oscillation Monitor
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![Arduino](https://img.shields.io/badge/Arduino-Compatible-00979D.svg)](https://www.arduino.cc/)
 
@@ -289,31 +288,25 @@ The synthetic signal includes:
 
 ## 👥 Team
 
-**Senior Design Project** - [Your University Name]
-- [Your Name] - Project Lead
-- [Team Member 2] - Hardware Development
-- [Team Member 3] - Software Development
-- **Advisor**: [Advisor Name]
+**Senior Design Project** - University of Pittsburgh
+- Connor Rees - Project Lead
+- Isabella Hsia - Financial Lead
+- Jaiden Steele
+- Isa Lisi
 
 **Clinical Consultant**: Former Respiratory Therapist with 35+ years experience
 
-## 📄 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
 ## 🙏 Acknowledgments
 
-- Respiratory therapists at [Hospital Name] for clinical insights
-- [University] Department of Biomedical Engineering
+- Respiratory therapists at UPMC for clinical insights
+- University of Pittsburgh Department of Biomedical Engineering
 - Electronic Cats for MPU6050 Arduino library
 - Open-source Python community
 
 ## 📧 Contact
 
 For questions, collaboration, or clinical feedback:
-- **Email**: your.email@university.edu
-- **Project Page**: [Link to project page]
-- **Issues**: [GitHub Issues](https://github.com/yourusername/hfov-monitor/issues)
+- **Email**: cwr31@pitt.edu
 
 ---
 
