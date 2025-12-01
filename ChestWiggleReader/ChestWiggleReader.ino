@@ -32,7 +32,10 @@ void loop() {
     mpu.getAcceleration(&ax, &ay, &az);
 
     // Compute magnitude
-    float magnitude = sqrt((long)ax * ax + (long)ay * ay + (long)az * az);
+  float ax_g = ax / 16384.0;
+  float ay_g = ay / 16384.0;
+  float az_g = az / 16384.0;
+  float magnitude = sqrt(ax_g * ax_g + ay_g * ay_g + az_g * az_g);
 
     // Print CSV: Time, Ax, Ay, Az, Magnitude
     Serial.print(currentTime); Serial.print(",");

@@ -157,14 +157,18 @@ class HFOVMonitor:
         # Now calculate magnitude from DC-removed signals
         mag = np.sqrt(ax**2 + ay**2 + az**2)
         
+        # Calculate raw RMS amplitude BEFORE filtering
+        raw_amp = np.std(mag) * 1000  # RMS in millig
+        
         # Apply bandpass filter
         mag_filt = signal.sosfiltfilt(self.sos, mag)
         
         # Amplitude (RMS of filtered signal in mg)
         amp = np.std(mag_filt) * 1000  # RMS amplitude in millig
         
-        # Only calculate frequency if amplitude is significant (> 0.5 mg)
-        if amp > 0.5:
+        # Only calculate frequency if RAW amplitude is significant (> 2 mg)
+        # This prevents counting filter artifacts as real signal
+        if raw_amp > 2.0:
             # Frequency (zero-crossing)
             crossings = 0
             for i in range(1, len(mag_filt)):
@@ -174,25 +178,26 @@ class HFOVMonitor:
         else:
             freq = 0  # No significant oscillation
         
-        # SNR calculation
-        signal_power = np.var(mag_filt)  # Use variance for power
-        noise = mag - mag_filt
-        noise_power = np.var(noise)  # Use variance for noise power
+        # SNR calculation - compare raw signal variance to filtered signal variance
+        signal_power = np.var(mag_filt)  # Filtered signal power
+        total_power = np.var(mag)  # Total power including noise
+        noise_power = total_power - signal_power  # Noise is what's left
         
-        # Calculate SNR in dB (handle edge cases)
-        if noise_power < 1e-12:  # Almost no noise (perfect signal)
-            snr = 40.0
-        elif signal_power < 1e-12:  # Almost no signal (pure noise)
-            snr = -40.0
+        # Make sure noise power is positive
+        if noise_power <= 0:
+            noise_power = 1e-12
+        
+        # Calculate SNR in dB
+        if signal_power < 1e-12:  # Almost no signal (pure noise)
+            snr = -30.0
         else:
             snr_ratio = signal_power / noise_power
             if snr_ratio > 0:
                 snr = 10 * np.log10(snr_ratio)
+                # Clamp to reasonable range
+                snr = np.clip(snr, -30.0, 40.0)
             else:
-                snr = -40.0
-        
-        # Clamp SNR to reasonable range
-        snr = np.clip(snr, -40.0, 40.0)
+                snr = -30.0
         
         return freq, amp, snr
     
@@ -284,7 +289,7 @@ class HFOVMonitor:
         self.ax_snr.set_ylabel('dB')
         self.ax_snr.grid(True, alpha=0.3)
         self.ax_snr.set_xlim(10, 0)
-        self.ax_snr.set_ylim(-20, 40)  # Allow negative SNR values
+        self.ax_snr.set_ylim(-30, 40)  # Allow negative SNR values
         self.line_snr = self.ax_snr.plot([], [], 'g-', linewidth=1.5, marker='o', markersize=3)[0]
         self.ax_snr.axhline(y=10, color='red', linestyle='--', linewidth=1.5, alpha=0.7)
     
@@ -463,9 +468,9 @@ class HFOVMonitor:
             self.ax_freq.set_ylim(0, max(20, max(freq_data) * 1.2))
             self.ax_amp.set_ylim(0, max(100, max(amp_data) * 1.2))
             # Allow SNR plot to show negative values
-            snr_min = min(snr_data) if snr_data else -20
+            snr_min = min(snr_data) if snr_data else -30
             snr_max = max(snr_data) if snr_data else 40
-            self.ax_snr.set_ylim(min(-20, snr_min - 5), max(40, snr_max + 5))
+            self.ax_snr.set_ylim(min(-30, snr_min - 5), max(40, snr_max + 5))
     
     def run(self):
         print("\n" + "="*70)
