@@ -7,10 +7,9 @@ import serial
 import serial.tools.list_ports
 from collections import deque
 import time
-# -*- coding: utf-8 -*-
 import sys
-import io
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+sys.stdout.reconfigure(encoding='utf-8')
+
 # System States
 STATE_NORMAL = 0
 STATE_LOW_SIGNAL = 1
@@ -92,7 +91,7 @@ class HFOVMonitor:
             raise ConnectionError("Failed to connect")
     
     def connect_serial(self, port, baudrate):
-        print(f"\n→ Connecting to {port}...")
+        print(f"\n> Connecting to {port}...")
         
         try:
             self.serial_port = serial.Serial(port, baudrate, timeout=0.01)
@@ -114,8 +113,8 @@ class HFOVMonitor:
                         continue
                     parts = line.split(',')
                     if len(parts) == 3:
-                        print(f"✓ Receiving data: {line[:30]}...")
-                        print(f"✓ Connected!\n")
+                        print(f"  Receiving data: {line[:30]}...")
+                        print(f"  Connected!\n")
                         return
             except:
                 pass
@@ -141,34 +140,99 @@ class HFOVMonitor:
         return None
     
     def analyze_signal(self):
-        """Compute frequency, amplitude, SNR from waveform buffer"""
-        if len(self.wave_mag) < 100:
+        if len(self.wave_mag) < 120:   # require ~1.2 sec of data
             return
-        
-        # Get data
-        mag = np.array(list(self.wave_mag))
-        
-        # Apply bandpass filter
-        mag_filt = signal.sosfiltfilt(self.sos, mag)
-        
-        # Frequency (zero-crossing)
-        crossings = 0
-        for i in range(1, len(mag_filt)):
-            if (mag_filt[i-1] >= 0 and mag_filt[i] < 0) or (mag_filt[i-1] < 0 and mag_filt[i] >= 0):
-                crossings += 1
-        freq = (crossings / 2.0) * self.fs / len(mag_filt)
-        
-        # Amplitude
-        amp = np.max(np.abs(mag_filt)) * 1000  # millig
-        
-        # SNR
-        signal_power = np.mean(mag_filt**2)
-        noise = mag - mag_filt
-        noise_power = np.mean(noise**2)
-        snr = 10 * np.log10(signal_power / (noise_power + 1e-10)) if noise_power > 0 else 40
-        
-        return freq, amp, max(0, snr)
-    
+
+        # Convert deque → numpy array
+        ax = np.array(self.wave_ax, dtype=float)
+        ay = np.array(self.wave_ay, dtype=float)
+        az = np.array(self.wave_az, dtype=float)
+
+        # Enhanced sanity checks -------------------------------------
+        if np.any(np.isnan(ax)) or np.any(np.isnan(ay)) or np.any(np.isnan(az)):
+            return 0, 0, -30
+
+        # Clip extreme spikes (protects FFT)
+        ax = np.clip(ax, -4, 4)
+        ay = np.clip(ay, -4, 4)
+        az = np.clip(az, -4, 4)
+
+        # Remove DC from each axis before magnitude calc
+        ax -= np.mean(ax)
+        ay -= np.mean(ay)
+        az -= np.mean(az)
+
+        # Magnitude
+        mag = np.sqrt(ax**2 + ay**2 + az**2)
+
+        # Raw RMS (mg)
+        raw_amp = np.std(mag) * 1000
+
+        # Bandpass filter
+        try:
+            mag_filt = signal.sosfiltfilt(self.sos, mag)
+        except Exception:
+            return 0, raw_amp, -30
+
+        # RMS amplitude (filtered)
+        amp = np.std(mag_filt) * 1000
+
+        # ------------------------------------------------------------
+        # 1) FFT-BASED FREQUENCY ESTIMATION (recommended)
+        # ------------------------------------------------------------
+        freq_fft = 0
+        if raw_amp > 2.0:  # only try FFT if actual oscillation exists
+            N = len(mag_filt)
+            window = np.hanning(N)
+            yf = np.abs(np.fft.rfft(mag_filt * window))
+            xf = np.fft.rfftfreq(N, 1.0 / self.fs)
+
+            # Limit to 5–15 Hz range
+            mask = (xf >= 5) & (xf <= 15)
+            if np.sum(mask) > 3:
+                yf_band = yf[mask]
+                xf_band = xf[mask]
+
+                peak_idx = np.argmax(yf_band)
+                peak = yf_band[peak_idx]
+
+                avg_power = np.mean(yf_band)
+
+                # Peak must be 2× larger than average noise floor
+                if peak > 2.0 * avg_power and peak > 0:
+                    freq_fft = xf_band[peak_idx]
+
+        # ------------------------------------------------------------
+        # 2) FALLBACK zero-crossing if FFT isn't confident
+        # ------------------------------------------------------------
+        if freq_fft == 0:
+            crossings = 0
+            for i in range(1, len(mag_filt)):
+                if (mag_filt[i-1] >= 0 and mag_filt[i] < 0) or (mag_filt[i-1] < 0 and mag_filt[i] >= 0):
+                    crossings += 1
+            freq_zc = (crossings / 2.0) * self.fs / len(mag_filt)
+            freq = freq_zc
+        else:
+            freq = freq_fft
+
+        # ------------------------------------------------------------
+        # SNR calculation
+        # ------------------------------------------------------------
+        signal_power = np.var(mag_filt)
+        total_power  = np.var(mag)
+
+        noise_power = total_power - signal_power
+        if noise_power <= 0:
+            noise_power = 1e-12
+
+        if signal_power < 1e-12:
+            snr = -30.0
+        else:
+            snr = 10 * np.log10(signal_power / noise_power)
+            snr = float(np.clip(snr, -30, 40))
+
+        return freq, amp, snr
+
     def setup_plot(self):
         self.fig = plt.figure(figsize=(18, 10))
         self.fig.suptitle('HFOV Clinical Monitor - Live Waveform', 
@@ -257,7 +321,7 @@ class HFOVMonitor:
         self.ax_snr.set_ylabel('dB')
         self.ax_snr.grid(True, alpha=0.3)
         self.ax_snr.set_xlim(10, 0)
-        self.ax_snr.set_ylim(0, 40)
+        self.ax_snr.set_ylim(-30, 40)  # Allow negative SNR values
         self.line_snr = self.ax_snr.plot([], [], 'g-', linewidth=1.5, marker='o', markersize=3)[0]
         self.ax_snr.axhline(y=10, color='red', linestyle='--', linewidth=1.5, alpha=0.7)
     
@@ -290,6 +354,10 @@ class HFOVMonitor:
                 self.current_amp = amp
                 self.current_snr = snr
                 
+                # Debug output every 5 seconds
+                if self.frame_count % 150 == 0:
+                    print(f"DEBUG: Freq={freq:.2f} Hz, Amp={amp:.2f} mg, SNR={snr:.2f} dB")
+                
                 elapsed = current_time - self.start_time
                 self.clin_time.append(elapsed)
                 self.clin_freq.append(freq)
@@ -320,15 +388,15 @@ class HFOVMonitor:
         state = self.current_state
         if state == STATE_NORMAL:
             self.alert_bg.set_facecolor('lightgreen')
-            self.alert_text.set_text('● SYSTEM NORMAL - Monitoring Active')
+            self.alert_text.set_text('* SYSTEM NORMAL - Monitoring Active')
             self.alert_text.set_color('darkgreen')
         elif state == STATE_LOW_SIGNAL:
             self.alert_bg.set_facecolor('yellow')
-            self.alert_text.set_text('⚠ WARNING: LOW SIGNAL QUALITY')
+            self.alert_text.set_text('! WARNING: LOW SIGNAL QUALITY')
             self.alert_text.set_color('orange')
         else:
             self.alert_bg.set_facecolor('red')
-            self.alert_text.set_text('⚠⚠ FAULT: NO DATA ⚠⚠')
+            self.alert_text.set_text('!! FAULT: NO DATA !!')
             self.alert_text.set_color('white')
     
     def update_waveform(self):
@@ -336,8 +404,18 @@ class HFOVMonitor:
             return
         
         t = np.array(list(self.wave_time))
-        mag = np.array(list(self.wave_mag))
+        
+        # Get raw data
+        ax = np.array(list(self.wave_ax))
+        ay = np.array(list(self.wave_ay))
+        az = np.array(list(self.wave_az))
         z = np.array(list(self.wave_az))
+        
+        # Remove DC from each axis before calculating magnitude
+        ax_ac = ax - np.mean(ax)
+        ay_ac = ay - np.mean(ay)
+        az_ac = az - np.mean(az)
+        mag = np.sqrt(ax_ac**2 + ay_ac**2 + az_ac**2)
         
         # Show last 2 seconds
         t_offset = t[-1] - 2
@@ -346,22 +424,22 @@ class HFOVMonitor:
         
         if np.sum(mask) > 0:
             self.line_mag.set_data(t_disp[mask], mag[mask])
-            self.line_z.set_data(t_disp[mask], z[mask])
+            self.line_z.set_data(t_disp[mask], az_ac[mask])  # Also show DC-removed z-axis
             
-            ymax = max(0.15, np.max(np.abs(mag[mask])) * 1.3)
+            ymax = max(0.15, np.max(np.abs(mag[mask])) * 1.3) if np.max(np.abs(mag[mask])) > 0 else 0.15
             self.ax_wave.set_ylim(-ymax, ymax)
             
             self.wave_annot.set_text(f'Samples: {len(self.wave_time)}\nFreq: {self.current_freq:.1f} Hz')
     
     def update_current(self):
         text = f"""
-┌────────────────────────┐
-│  CHEST WIGGLE FACTOR   │
-├────────────────────────┤
-│  Freq: {self.current_freq:5.1f} Hz    │
-│  Amp:  {self.current_amp:5.1f} mg    │
-│  SNR:  {self.current_snr:5.1f} dB    │
-└────────────────────────┘
++------------------------+
+|  CHEST WIGGLE FACTOR   |
++------------------------+
+|  Freq: {self.current_freq:5.1f} Hz    |
+|  Amp:  {self.current_amp:5.1f} mg    |
+|  SNR:  {self.current_snr:5.1f} dB    |
++------------------------+
         """
         self.curr_text.set_text(text)
         
@@ -374,6 +452,8 @@ class HFOVMonitor:
             return
         
         data = np.array(list(self.wave_mag))
+        data = data - np.mean(data)  # Remove DC offset
+        
         try:
             freqs, psd = signal.welch(data, fs=self.fs, nperseg=min(64, len(data)))
             psd_db = 10 * np.log10(psd + 1e-12)
@@ -388,13 +468,13 @@ class HFOVMonitor:
     def update_status(self):
         elapsed = time.time() - self.start_time
         text = f"""
-┌──────────────────┐
-│  Status          │
-├──────────────────┤
-│  {STATE_NAMES[self.current_state]:<15s} │
-│  Runtime: {elapsed:5.0f}s  │
-│  Samples: {self.sample_count:<6d} │
-└──────────────────┘
++------------------+
+|  Status          |
++------------------+
+|  {STATE_NAMES[self.current_state]:<15s} |
+|  Runtime: {elapsed:5.0f}s  |
+|  Samples: {self.sample_count:<6d} |
++------------------+
         """
         self.stat_text.set_text(text)
         self.stat_text.get_bbox_patch().set_facecolor(STATE_COLORS[self.current_state])
@@ -419,17 +499,20 @@ class HFOVMonitor:
         if len(freq_data) > 0:
             self.ax_freq.set_ylim(0, max(20, max(freq_data) * 1.2))
             self.ax_amp.set_ylim(0, max(100, max(amp_data) * 1.2))
-            self.ax_snr.set_ylim(0, max(40, max(snr_data) * 1.2))
+            # Allow SNR plot to show negative values
+            snr_min = min(snr_data) if snr_data else -30
+            snr_max = max(snr_data) if snr_data else 40
+            self.ax_snr.set_ylim(min(-30, snr_min - 5), max(40, snr_max + 5))
     
     def run(self):
         print("\n" + "="*70)
         print("HFOV MONITOR - Streaming at 100 Hz")
         print("="*70)
         print("\nFeatures:")
-        print("  • Real-time waveform (100 Hz)")
-        print("  • Clinical metrics (5 Hz)")
-        print("  • Live spectrum")
-        print("  • 10-second trends")
+        print("  - Real-time waveform (100 Hz)")
+        print("  - Clinical metrics (5 Hz)")
+        print("  - Live spectrum")
+        print("  - 10-second trends")
         print("\nPress Q to quit")
         print("="*70 + "\n")
         
