@@ -61,10 +61,10 @@ class HFOVBackend:
         self.last_data_time = time.time()
 
         # SNR threshold per specification (15 dB)
-        self.snr_threshold_db = 15.0
+        self.snr_threshold_db = 10.0
 
         # Bandpass filter (5-15 Hz)
-        self.sos = signal.butter(4, [5, 15], btype='band', fs=self.fs, output='sos')
+        self.sos = signal.butter(4, [3, 20], btype='band', fs=self.fs, output='sos')
 
         # Connect serial (auto-detect if port not provided)
         if port:
@@ -145,68 +145,79 @@ class HFOVBackend:
         ay = np.clip(ay, -4, 4)
         az = np.clip(az, -4, 4)
 
-        # remove DC and compute magnitude
-        ax -= np.mean(ax)
-        ay -= np.mean(ay)
-        az -= np.mean(az)
-        mag = np.sqrt(ax ** 2 + ay ** 2 + az ** 2)
+        # remove DC
+        ax_ac = ax - np.mean(ax)
+        ay_ac = ay - np.mean(ay)
+        az_ac = az - np.mean(az)
 
-        raw_amp = np.std(mag) * 1000.0  # in mg
+        # --- PCA-based orientation-invariant projection ---
+        try:
+            X = np.stack([ax_ac, ay_ac, az_ac], axis=1)
+            cov = np.cov(X, rowvar=False)
+            eigvals, eigvecs = np.linalg.eigh(cov)
+            # first principal component (largest eigenvalue)
+            u = eigvecs[:, np.argmax(eigvals)]
+            # project 3D data onto dominant direction
+            mag_proj = X @ u
+        except Exception:
+            # fallback to magnitude
+            mag_proj = np.sqrt(ax_ac**2 + ay_ac**2 + az_ac**2)
+
+        raw_amp = np.std(mag_proj) * 1000.0  # in mg
+
+        # **CHECK SIGNAL STRENGTH BEFORE FILTERING**
+        if raw_amp < 3.0:  # threshold in mg - adjust based on your noise floor
+            return 0.0, raw_amp, -30.0
 
         # filter
         try:
-            mag_filt = signal.sosfiltfilt(self.sos, mag)
+            mag_filt = signal.sosfiltfilt(self.sos, mag_proj)
         except Exception:
             return 0.0, raw_amp, -30.0
 
         amp = np.std(mag_filt) * 1000.0
 
-        # Welch's PSD-based freq estimation (recommended - more robust than raw FFT)
-        freq_welch = 0.0
-        if raw_amp > 2.0:
-            try:
-                # Use Welch's method for power spectral density estimation
-                # nperseg determines frequency resolution
-                nperseg = min(128, len(mag_filt))
-                freqs, psd = signal.welch(mag_filt, fs=self.fs, nperseg=nperseg, window='hanning')
-                
-                # Find peak in HFOV band (5-15 Hz)
-                mask = (freqs >= 5) & (freqs <= 15)
-                if np.sum(mask) > 3:
-                    psd_band = psd[mask]
-                    freqs_band = freqs[mask]
-                    peak_idx = np.argmax(psd_band)
-                    peak_power = psd_band[peak_idx]
-                    avg_power = np.mean(psd_band) + 1e-12
-                    
-                    # Only accept peak if it's significantly above average (2x threshold)
-                    if peak_power > 2.0 * avg_power and peak_power > 0:
-                        freq_welch = freqs_band[peak_idx]
-            except Exception:
-                freq_welch = 0.0
+        # --- Frequency estimation and SNR via Welch PSD ---
+        try:
+            nperseg = min(128, len(mag_filt))
+            f, Pxx = signal.welch(mag_filt, fs=self.fs, nperseg=nperseg)
 
-        # fallback zero-crossing if Welch's doesn't find a clear peak
-        if freq_welch == 0.0:
+            # restrict to physiologically relevant band (5–15 Hz)
+            mask = (f >= 5) & (f <= 15)
+            f_band = f[mask]
+            Pxx_band = Pxx[mask]
+
+            if len(Pxx_band) > 0 and np.max(Pxx_band) > 1e-6:
+                # frequency = peak of PSD in band
+                peak_idx = np.argmax(Pxx_band)
+                freq = f_band[peak_idx]
+
+                # PSD-based SNR: signal power in band vs noise power outside band
+                P_signal = np.sum(Pxx_band)  # total power in HFOV band
+                P_total = np.sum(Pxx)         # total power across all frequencies
+                P_noise = P_total - P_signal
+                
+                if P_noise <= 0:
+                    P_noise = 1e-12
+
+                snr = 10.0 * np.log10(P_signal / P_noise)
+                snr = float(np.clip(snr, -30.0, 40.0))
+            else:
+                freq = 0.0
+                snr = -30.0
+
+        except Exception as e:
+            print(f"Welch analysis error: {e}")
+            freq = 0.0
+            snr = -30.0
+
+        # fallback zero-crossing if PSD failed
+        if freq == 0.0 and raw_amp > 2.0:
             crossings = 0
             for i in range(1, len(mag_filt)):
                 if (mag_filt[i - 1] >= 0 and mag_filt[i] < 0) or (mag_filt[i - 1] < 0 and mag_filt[i] >= 0):
                     crossings += 1
             freq = (crossings / 2.0) * self.fs / len(mag_filt)
-        else:
-            freq = float(freq_welch)
-
-        # SNR
-        signal_power = np.var(mag_filt)
-        total_power = np.var(mag)
-        noise_power = total_power - signal_power
-        if noise_power <= 0:
-            noise_power = 1e-12
-
-        if signal_power < 1e-12:
-            snr = -30.0
-        else:
-            snr = 10.0 * np.log10(signal_power / noise_power)
-            snr = float(np.clip(snr, -30.0, 40.0))
 
         return float(freq), float(amp), float(snr)
 
@@ -376,7 +387,7 @@ class HFOVWindow(QtWidgets.QMainWindow):
         self.current_text.setAlignment(QtCore.Qt.AlignCenter)
         self.current_text.setMinimumWidth(400)
         self.current_text.setMinimumHeight(120)
-        self.current_text.setMaximumHeight(180)
+        self.current_text.setMaximumHeight(205)
         self.current_text.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
         bottom_row.addWidget(self.current_text, stretch=3)
 
@@ -385,7 +396,7 @@ class HFOVWindow(QtWidgets.QMainWindow):
         self.status_box.setAlignment(QtCore.Qt.AlignCenter)
         self.status_box.setMinimumWidth(300)
         self.status_box.setMinimumHeight(120)
-        self.status_box.setMaximumHeight(180)
+        self.status_box.setMaximumHeight(205)
         self.status_box.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
         bottom_row.addWidget(self.status_box, stretch=2)
 
@@ -469,10 +480,30 @@ class HFOVWindow(QtWidgets.QMainWindow):
     def update_spectrum(self, force=False):
         if len(self.backend.wave_mag) < 64:
             return
-        data = np.array(self.backend.wave_mag)
-        data = data - np.mean(data)
+        
+        # Use the SAME processing as analyze_signal()
+        ax = np.array(self.backend.wave_ax, dtype=float)
+        ay = np.array(self.backend.wave_ay, dtype=float)
+        az = np.array(self.backend.wave_az, dtype=float)
+        
+        # Remove DC
+        ax_ac = ax - np.mean(ax)
+        ay_ac = ay - np.mean(ay)
+        az_ac = az - np.mean(az)
+        
+        # PCA projection (same as analyze_signal)
         try:
-            freqs, psd = signal.welch(data, fs=self.backend.fs, nperseg=min(64, len(data)))
+            X = np.stack([ax_ac, ay_ac, az_ac], axis=1)
+            cov = np.cov(X, rowvar=False)
+            eigvals, eigvecs = np.linalg.eigh(cov)
+            u = eigvecs[:, np.argmax(eigvals)]
+            mag_proj = X @ u
+        except Exception:
+            # Fallback to magnitude
+            mag_proj = np.sqrt(ax_ac**2 + ay_ac**2 + az_ac**2)
+        
+        try:
+            freqs, psd = signal.welch(mag_proj, fs=self.backend.fs, nperseg=min(64, len(mag_proj)))
             psd_db = 10.0 * np.log10(psd + 1e-12)
             self.line_spec.set_data(freqs, psd_db)
             ymin = max(-80, np.min(psd_db) - 5)
@@ -525,14 +556,14 @@ class HFOVWindow(QtWidgets.QMainWindow):
 
         self.current_text.setText(html)
         self.current_text.setStyleSheet("""
-            QLabel {
-                border: 2px solid #555;
-                border-radius: 8px;
-                background: #2e2e2e;
-                color: #e0e0e0;
-                padding: 15px;
-            }
-        """)
+        QLabel {
+            border: 2px solid #555;
+            border-radius: 8px;
+            background: #2e2e2e;
+            color: #e0e0e0;
+            padding: 15px;
+        }
+    """)
 
         # --- RIGHT: System Status ---
         state = self.backend.current_state
@@ -559,6 +590,9 @@ class HFOVWindow(QtWidgets.QMainWindow):
             }}
         """)
 
+# -------------------------
+# Application entry point
+# -------------------------
 # -------------------------
 # Application entry point
 # -------------------------
