@@ -1,0 +1,27 @@
+{
+  "name": "chestwiggleproject",
+  "version": "1.0.0",
+  "description": "[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)\r [![Arduino](https://img.shields.io/badge/Arduino-Compatible-00979D.svg)](https://www.arduino.cc/)",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Jaiden-Steele/ChestWiggleProject.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/Jaiden-Steele/ChestWiggleProject/issues"
+  },
+  "homepage": "https://github.com/Jaiden-Steele/ChestWiggleProject#readme",
+  "dependencies": {
+    "express": "^5.2.1",
+    "msgpack-lite": "^0.1.26",
+    "ws": "^8.19.0",
+    "zeromq": "^6.5.0"
+  }
+}
