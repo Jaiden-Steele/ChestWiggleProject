@@ -1,21 +1,162 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <title>HFOV RTMA Canvas</title>
-  <link rel="stylesheet" href="styles.css">
+  <title>HFOV RTMA Dashboard</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      background: #0f172a;
+      color: white;
+      margin: 0;
+      padding: 20px;
+    }
+    
+    #canvas {
+      background: #020617;
+      border-radius: 8px;
+      width: 100%;
+      height: calc(100vh - 180px);
+      border: 1px solid #334155;
+      position: relative;
+      overflow: hidden;
+    }
+    
+    .widget {
+      position: absolute;
+      background: #1e293b;
+      border: 2px solid #334155;
+      border-radius: 8px;
+      padding: 10px;
+      cursor: move;
+      color: white;
+      min-width: 300px;
+      min-height: 250px;
+      resize: both;
+      overflow: auto;
+    }
+    
+    .widget:hover {
+      border-color: #60a5fa;
+    }
+    
+    .widget-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 10px;
+      padding-bottom: 5px;
+      border-bottom: 1px solid #334155;
+      cursor: move;
+    }
+    
+    .widget-title {
+      font-weight: bold;
+      font-size: 14px;
+      color: #e2e8f0;
+    }
+    
+    .widget-close {
+      cursor: pointer;
+      color: #ef4444;
+      font-weight: bold;
+      font-size: 18px;
+      line-height: 1;
+      padding: 0 5px;
+    }
+    
+    .widget-close:hover {
+      color: #dc2626;
+    }
+    
+    .widget-value {
+      font-size: 24px;
+      font-weight: bold;
+      color: #60a5fa;
+      text-align: center;
+      padding: 20px;
+    }
+    
+    .widget-chart {
+      width: 100%;
+      height: 200px;
+      position: relative;
+    }
+    
+    .toolbar {
+      display: flex;
+      gap: 10px;
+      margin-bottom: 15px;
+      flex-wrap: wrap;
+    }
+    
+    .tool {
+      background: #1e293b;
+      padding: 10px 16px;
+      border-radius: 6px;
+      cursor: grab;
+      border: 1px solid #334155;
+      transition: all 0.2s;
+    }
+    
+    .tool:hover {
+      background: #334155;
+      border-color: #60a5fa;
+      transform: translateY(-2px);
+    }
+    
+    .tool:active {
+      cursor: grabbing;
+    }
+    
+    .alert-banner {
+      background: #1e293b;
+      padding: 15px;
+      border-radius: 8px;
+      margin-bottom: 15px;
+      text-align: center;
+      font-size: 18px;
+      font-weight: bold;
+      border: 2px solid #334155;
+    }
+    
+    .alert-normal {
+      background: #065f46;
+      border-color: #10b981;
+      color: #d1fae5;
+    }
+    
+    .alert-warning {
+      background: #78350f;
+      border-color: #f59e0b;
+      color: #fef3c7;
+    }
+    
+    .alert-fault {
+      background: #7f1d1d;
+      border-color: #ef4444;
+      color: #fecaca;
+    }
+  </style>
 </head>
 <body>
+  <h1>HFOV Chest Wiggle Dashboard</h1>
+  
+  <div class="alert-banner" id="alertBanner">
+    Connecting to RTMA stream...
+  </div>
 
-<h1>HFOV RTMA Canvas</h1>
+  <div class="toolbar">
+    <div class="tool" draggable="true" data-widget="frequency-value">📊 Frequency Value</div>
+    <div class="tool" draggable="true" data-widget="snr-value">📈 SNR Value</div>
+    <div class="tool" draggable="true" data-widget="accel-value">🎯 Filtered Accel</div>
+    <div class="tool" draggable="true" data-widget="frequency-trend">📉 Frequency Trend</div>
+    <div class="tool" draggable="true" data-widget="snr-trend">📉 SNR Trend</div>
+    <div class="tool" draggable="true" data-widget="waveform">〰️ Waveform</div>
+  </div>
 
-<div id="toolbar">
-  <div class="tool" draggable="true" data-widget="frequency">Frequency</div>
-  <div class="tool" draggable="true" data-widget="snr">SNR</div>
-  <div class="tool" draggable="true" data-widget="error">Freq Error</div>
-</div>
+  <div id="canvas"></div>
 
-<div id="canvas"></div>
-
-<script src="dashboard.js"></script>
+  <script src="dashboard.js"></script>
 </body>
 </html>

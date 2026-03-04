@@ -5,6 +5,7 @@ Role: Main application for HFOV monitoring
 
 import time
 
+from dashboard.rtma_zmq_bridge import RTMAZMQBridge
 from rtma.bus import RTMABus
 from rtma.recorder import RTMARecorder
 
@@ -19,8 +20,9 @@ from loggers.frequency_error_logger import FrequencyErrorLogger
 from loggers.snr_logger import SNRLogger
 
 bus = RTMABus()
+bridge = RTMAZMQBridge(bus, addr="tcp://*:5555")
 
-# ── Modules ──────────────────────────────────────────────
+#  Modules 
 acq = AccelAcq(bus)
 DigitalFilter(fs=100, bus=bus)
 FrequencyEstimator(fs=100, bus=bus)
@@ -30,11 +32,11 @@ FrequencyErrorCalculator(bus)
 # Reference frequency source
 ref_freq = ReferenceFrequency(f_ref=10.0)
 
-# ── Loggers (verification artifacts) ─────────────────────
+#  Loggers (verification artifacts) 
 FrequencyErrorLogger(bus, "frequency_error.csv")
 SNRLogger(bus, "snr.csv")
 
-# ── RTMA recorder (audit + replay) ───────────────────────
+#  RTMA recorder (audit + replay) 
 recorder = RTMARecorder(bus, "rtma_recording.csv")
 
 print("RTMA system running...")
@@ -42,10 +44,8 @@ print("RTMA system running...")
 try:
     while True:
         t = time.time()
-
-        acq.poll()                      # hardware acquisition
-        bus.publish(ref_freq.update(t)) # explicit reference signal
-
+        acq.poll()
+        bus.publish(ref_freq.update(t))
         time.sleep(0.001)
 
 except KeyboardInterrupt:
