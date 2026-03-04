@@ -1,38 +1,53 @@
 # modules/snr_estimator.py
-
 import numpy as np
-from collections import deque
-from rtma.messages.filtered_accel_msg import FilteredAccelMsg
-from rtma.messages.snr_msg import SNRMsg
+from scipy import signal
+from rtma.messages import FilteredAccelMsg, SNRMsg
+
 
 class SNREstimator:
+    """
+    Estimates SNR as the ratio of in-band (5–15 Hz) PSD power to
+    out-of-band power — matching the LivePlot_V9 reference exactly.
+
+    SNR (dB) = 10 * log10( P_signal / P_noise )
+    where P_signal = sum(Pxx) in [5, 15] Hz
+          P_noise  = sum(Pxx) outside that band
+    Result is clipped to [−30, 40] dB.
+    """
+
+    FREQ_LOW  = 5.0
+    FREQ_HIGH = 15.0
+    SNR_MIN   = -30.0
+    SNR_MAX   =  40.0
+
     def __init__(self, bus, fs=100):
-        self.bus = bus
         self.fs = fs
-
-        self.buffer = deque(maxlen=256)
-
+        self.bus = bus
         bus.subscribe(FilteredAccelMsg, self.on_filtered)
 
+    # ------------------------------------------------------------------
     def on_filtered(self, msg: FilteredAccelMsg):
-        self.buffer.append(msg.value)  
+        mag_filt = np.asarray(msg.value, dtype=float)
 
-        if len(self.buffer) < 128:
+        if len(mag_filt) < 64:
             return
 
-        x = np.array(self.buffer)
+        nperseg = min(128, len(mag_filt))
+        try:
+            f, Pxx = signal.welch(mag_filt, fs=self.fs, nperseg=nperseg)
+        except Exception:
+            return
 
-        signal_power = np.mean(x**2)
-        noise_power = np.var(x - np.mean(x))
+        mask_signal = (f >= self.FREQ_LOW) & (f <= self.FREQ_HIGH)
 
-        if noise_power <= 0:
-            snr_db = -30.0
-        else:
-            snr_db = 10 * np.log10(signal_power / noise_power)
+        P_signal = float(np.sum(Pxx[mask_signal]))
+        P_total  = float(np.sum(Pxx))
+        P_noise  = P_total - P_signal
 
-        self.bus.publish(
-            SNRMsg(
-                t=msg.t,
-                snr_db=float(snr_db)
-            )
-        )
+        if P_noise <= 0:
+            P_noise = 1e-12
+
+        snr_db = 10.0 * np.log10(P_signal / P_noise)
+        snr_db = float(np.clip(snr_db, self.SNR_MIN, self.SNR_MAX))
+
+        self.bus.publish(SNRMsg(t=msg.t, snr_db=snr_db))

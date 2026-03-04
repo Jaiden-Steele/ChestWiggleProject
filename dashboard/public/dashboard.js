@@ -1,49 +1,90 @@
 console.log("🔥 Dashboard JS loaded");
 
-// --- WebSocket Connection ---
+// ---------------------------------------------------------------------------
+// WebSocket Connection
+// ---------------------------------------------------------------------------
 const ws = new WebSocket("ws://localhost:3000");
 
-// --- Data Storage ---
+// ---------------------------------------------------------------------------
+// Data Store
+// ---------------------------------------------------------------------------
 const dataStore = {
-  frequency: [],
-  snr: [],
-  accel: [],
-  waveform: { time: [], mag: [], z: [] },
+  frequency:   [],
+  snr:         [],
+  accel:       [],
+  waveform:    { time: [], ax: [], ay: [], az: [] }, // raw axes for DC removal
   currentFreq: 0,
-  currentSNR: 0,
+  currentSNR:  -30,
   currentAccel: 0,
-  maxPoints: 50 // Keep last 50 points for trends
+  currentState: "normal",   // "normal" | "warning" | "fault"
+  maxPoints:   50           // trend history length
 };
 
-// --- Widget Management ---
+// Rolling mean accumulators for waveform DC removal (matches reference update_waveform)
+const DC_WINDOW = 200;
+const dcBuf = { ax: [], ay: [], az: [] };
+
+// ---------------------------------------------------------------------------
+// Widget Registry
+// ---------------------------------------------------------------------------
 const widgets = {};
 
-// --- WebSocket Handlers ---
+// ---------------------------------------------------------------------------
+// WebSocket Handlers
+// ---------------------------------------------------------------------------
 ws.onopen = () => {
   console.log("✅ WebSocket connected");
-  updateAlert("normal", "Connected to RTMA stream");
+  updateAlert("normal", "✓ Connected to RTMA stream");
 };
 
 ws.onmessage = (event) => {
   const packet = JSON.parse(event.data);
   const { topic, msg } = packet;
-
   const now = Date.now();
 
-  if (topic === "SNRMsg" && msg.snr_db !== undefined) {
-    dataStore.currentSNR = msg.snr_db;
-    dataStore.snr.push({ time: now, value: msg.snr_db });
-    if (dataStore.snr.length > dataStore.maxPoints) dataStore.snr.shift();
-    updateWidgets("snr");
+  // --- Accelerometer raw data (waveform + DC accumulators) ---
+  if (topic === "AccelMsg") {
+    // Accumulate for running mean (DC removal, same as reference)
+    for (const axis of ["ax", "ay", "az"]) {
+      dcBuf[axis].push(msg[axis]);
+      if (dcBuf[axis].length > DC_WINDOW) dcBuf[axis].shift();
+    }
+
+    const meanAx = mean(dcBuf.ax);
+    const meanAy = mean(dcBuf.ay);
+    const meanAz = mean(dcBuf.az);
+
+    const ax_ac = msg.ax - meanAx;
+    const ay_ac = msg.ay - meanAy;
+    const az_ac = msg.az - meanAz;
+    const mag   = Math.sqrt(ax_ac**2 + ay_ac**2 + az_ac**2);
+
+    const t = msg.t ?? (now / 1000);
+    dataStore.waveform.time.push(t);
+    dataStore.waveform.mag  = dataStore.waveform.mag  ?? [];
+    dataStore.waveform.mag.push(mag);
+    dataStore.waveform.z   = dataStore.waveform.z    ?? [];
+    dataStore.waveform.z.push(az_ac);
+
+    if (dataStore.waveform.time.length > DC_WINDOW) {
+      dataStore.waveform.time.shift();
+      dataStore.waveform.mag.shift();
+      dataStore.waveform.z.shift();
+    }
+
+    updateWidgets("waveform");
   }
 
-  if (topic === "ReferenceFreqMsg" && msg.f_ref !== undefined) {
-    dataStore.currentFreq = msg.f_ref;
-    dataStore.frequency.push({ time: now, value: msg.f_ref });
-    if (dataStore.frequency.length > dataStore.maxPoints) dataStore.frequency.shift();
-    updateWidgets("frequency");
+  // --- Filtered acceleration amplitude ---
+  if (topic === "FilteredAccelMsg" && msg.value !== undefined) {
+    // value is now a scalar amplitude (std of filtered window, in mg)
+    dataStore.currentAccel = msg.value;
+    dataStore.accel.push({ time: now, value: msg.value });
+    if (dataStore.accel.length > dataStore.maxPoints) dataStore.accel.shift();
+    updateWidgets("accel");
   }
 
+  // --- Estimated frequency ---
   if (topic === "FrequencyMsg" && msg.f_hz !== undefined) {
     dataStore.currentFreq = msg.f_hz;
     dataStore.frequency.push({ time: now, value: msg.f_hz });
@@ -51,69 +92,74 @@ ws.onmessage = (event) => {
     updateWidgets("frequency");
   }
 
-  if (topic === "FilteredAccelMsg" && msg.value !== undefined) {
-    dataStore.currentAccel = msg.value;
-    dataStore.accel.push({ time: now, value: msg.value });
-    if (dataStore.accel.length > dataStore.maxPoints) dataStore.accel.shift();
-    updateWidgets("accel");
+  // --- Reference frequency (also feed the frequency trend) ---
+  if (topic === "ReferenceFreqMsg" && msg.f_ref !== undefined) {
+    dataStore.frequency.push({ time: now, value: msg.f_ref });
+    if (dataStore.frequency.length > dataStore.maxPoints) dataStore.frequency.shift();
+    updateWidgets("frequency");
   }
 
-  if (topic === "AccelMsg") {
-    const t = msg.t || now / 1000;
-    const mag = Math.sqrt(msg.ax**2 + msg.ay**2 + msg.az**2);
-    
-    dataStore.waveform.time.push(t);
-    dataStore.waveform.mag.push(mag);
-    dataStore.waveform.z.push(msg.az);
-    
-    if (dataStore.waveform.time.length > 200) {
-      dataStore.waveform.time.shift();
-      dataStore.waveform.mag.shift();
-      dataStore.waveform.z.shift();
-    }
-    
-    updateWidgets("waveform");
+  // --- SNR ---
+  if (topic === "SNRMsg" && msg.snr_db !== undefined) {
+    dataStore.currentSNR = msg.snr_db;
+    dataStore.snr.push({ time: now, value: msg.snr_db });
+    if (dataStore.snr.length > dataStore.maxPoints) dataStore.snr.shift();
+    updateWidgets("snr");
   }
 
-  // Check signal quality for alerts
-  if (dataStore.currentSNR < 8.0 && dataStore.currentSNR > -20) {
-    updateAlert("warning", "⚠ WARNING: LOW SIGNAL QUALITY");
-  } else if (dataStore.currentSNR >= 8.0) {
-    updateAlert("normal", "✓ SYSTEM NORMAL - Monitoring Active");
+  // --- State from StateMonitor (authoritative) ---
+  if (topic === "StateMsg" && msg.state !== undefined) {
+    // 0 = NORMAL, 1 = LOW_SIGNAL, 2 = FAULT  (matches state_monitor.py constants)
+    const stateMap = {
+      0: { css: "normal",  text: "✓ SYSTEM NORMAL — Monitoring Active" },
+      1: { css: "warning", text: "⚠ WARNING: LOW SIGNAL QUALITY" },
+      2: { css: "fault",   text: "!! FAULT: NO DATA !!" }
+    };
+    const s = stateMap[msg.state] ?? stateMap[0];
+    dataStore.currentState = s.css;
+    updateAlert(s.css, s.text);
   }
 };
 
-ws.onerror = (error) => {
-  console.error("❌ WebSocket error:", error);
+ws.onerror = () => {
   updateAlert("fault", "!! FAULT: CONNECTION ERROR !!");
 };
 
 ws.onclose = () => {
-  console.log("🔌 WebSocket closed");
   updateAlert("fault", "!! FAULT: NO DATA !!");
 };
 
-// --- Alert Banner ---
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+function mean(arr) {
+  return arr.length === 0 ? 0 : arr.reduce((a, b) => a + b, 0) / arr.length;
+}
+
+// ---------------------------------------------------------------------------
+// Alert Banner
+// ---------------------------------------------------------------------------
 function updateAlert(state, message) {
   const banner = document.getElementById("alertBanner");
   banner.textContent = message;
   banner.className = `alert-banner alert-${state}`;
 }
 
-// --- Widget Update Logic ---
+// ---------------------------------------------------------------------------
+// Widget Update Dispatch
+// ---------------------------------------------------------------------------
 function updateWidgets(dataType) {
-  Object.values(widgets).forEach(widget => {
-    if (widget.dataType === dataType) {
-      widget.update();
-    }
+  Object.values(widgets).forEach(w => {
+    if (w.dataType === dataType) w.update();
   });
 }
 
-// --- Drag and Drop ---
+// ---------------------------------------------------------------------------
+// Drag-and-Drop onto Canvas
+// ---------------------------------------------------------------------------
 const canvas = document.getElementById("canvas");
-const tools = document.querySelectorAll(".tool");
 
-tools.forEach(tool => {
+document.querySelectorAll(".tool").forEach(tool => {
   tool.addEventListener("dragstart", e => {
     e.dataTransfer.setData("widgetType", tool.dataset.widget);
   });
@@ -124,44 +170,36 @@ canvas.addEventListener("dragover", e => e.preventDefault());
 canvas.addEventListener("drop", e => {
   e.preventDefault();
   const type = e.dataTransfer.getData("widgetType");
-  const rect = canvas.getBoundingClientRect();
-  const x = e.clientX - rect.left;
-  const y = e.clientY - rect.top;
-  createWidget(type, x, y);
+  const rect  = canvas.getBoundingClientRect();
+  createWidget(type, e.clientX - rect.left, e.clientY - rect.top);
 });
 
-// --- Widget Factory ---
+// ---------------------------------------------------------------------------
+// Widget Factory
+// ---------------------------------------------------------------------------
 function createWidget(type, x, y) {
-  const id = crypto.randomUUID();
+  const id  = crypto.randomUUID();
   const div = document.createElement("div");
   div.className = "widget";
-  div.id = id;
+  div.id        = id;
   div.style.left = x + "px";
-  div.style.top = y + "px";
+  div.style.top  = y + "px";
 
   let widget;
-
-  switch(type) {
+  switch (type) {
     case "frequency-value":
-      widget = new ValueWidget(div, "Frequency", "frequency", " Hz", "#60a5fa");
-      break;
+      widget = new ValueWidget(div, "Frequency",       "frequency", " Hz", "#60a5fa"); break;
     case "snr-value":
-      widget = new ValueWidget(div, "SNR", "snr", " dB", "#10b981");
-      break;
+      widget = new ValueWidget(div, "SNR",             "snr",       " dB", "#10b981"); break;
     case "accel-value":
-      widget = new ValueWidget(div, "Filtered Accel", "accel", "", "#f59e0b");
-      break;
+      widget = new ValueWidget(div, "Filtered Accel",  "accel",     " mg", "#f59e0b"); break;
     case "frequency-trend":
-      widget = new TrendWidget(div, "Frequency Trend (10s)", "frequency", "Hz", "#60a5fa");
-      break;
+      widget = new TrendWidget(div, "Frequency (10s)", "frequency", "Hz",  "#60a5fa"); break;
     case "snr-trend":
-      widget = new TrendWidget(div, "SNR Trend (10s)", "snr", "dB", "#10b981");
-      break;
+      widget = new TrendWidget(div, "SNR (10s)",       "snr",       "dB",  "#10b981"); break;
     case "waveform":
-      widget = new WaveformWidget(div);
-      break;
-    default:
-      return;
+      widget = new WaveformWidget(div); break;
+    default: return;
   }
 
   widgets[id] = widget;
@@ -170,201 +208,126 @@ function createWidget(type, x, y) {
   widget.update();
 }
 
-// --- Widget Classes ---
+// ---------------------------------------------------------------------------
+// Widget Classes
+// ---------------------------------------------------------------------------
 class ValueWidget {
   constructor(element, title, dataType, unit, color) {
-    this.element = element;
+    this.element  = element;
     this.dataType = dataType;
-    this.unit = unit;
-    this.color = color;
-    
+    this.unit     = unit;
+
     element.innerHTML = `
       <div class="widget-header">
         <span class="widget-title">${title}</span>
         <span class="widget-close" onclick="removeWidget('${element.id}')">×</span>
       </div>
-      <div class="widget-value" style="color: ${color}">--</div>
-    `;
-    
+      <div class="widget-value" style="color:${color}">--</div>`;
+
     this.valueEl = element.querySelector(".widget-value");
   }
-  
+
   update() {
-    let value;
-    if (this.dataType === "frequency") value = dataStore.currentFreq;
-    else if (this.dataType === "snr") value = dataStore.currentSNR;
-    else if (this.dataType === "accel") value = dataStore.currentAccel;
-    
-    this.valueEl.textContent = value.toFixed(2) + this.unit;
+    const v =
+      this.dataType === "frequency" ? dataStore.currentFreq  :
+      this.dataType === "snr"       ? dataStore.currentSNR   :
+                                      dataStore.currentAccel;
+    this.valueEl.textContent = (typeof v === "number" ? v.toFixed(2) : "--") + this.unit;
   }
 }
 
+// ---------------------------------------------------------------------------
 class TrendWidget {
   constructor(element, title, dataType, yLabel, color) {
-    this.element = element;
+    this.element  = element;
     this.dataType = dataType;
-    
+
     element.innerHTML = `
       <div class="widget-header">
         <span class="widget-title">${title}</span>
         <span class="widget-close" onclick="removeWidget('${element.id}')">×</span>
       </div>
-      <div class="widget-chart">
-        <canvas></canvas>
-      </div>
-    `;
-    
+      <div class="widget-chart"><canvas></canvas></div>`;
+
     const ctx = element.querySelector("canvas").getContext("2d");
-    
     this.chart = new Chart(ctx, {
       type: "line",
       data: {
         labels: [],
         datasets: [{
-          label: yLabel,
-          data: [],
-          borderColor: color,
-          backgroundColor: color + "33",
-          borderWidth: 2,
-          tension: 0.4,
-          fill: true,
-          pointRadius: 2,
-          pointBackgroundColor: color
+          label: yLabel, data: [],
+          borderColor: color, backgroundColor: color + "33",
+          borderWidth: 2, tension: 0.4, fill: true,
+          pointRadius: 2, pointBackgroundColor: color
         }]
       },
       options: {
-        responsive: true,
-        maintainAspectRatio: false,
+        responsive: true, maintainAspectRatio: false, animation: false,
         scales: {
-          x: {
-            ticks: { 
-              color: "#94a3b8",
-              maxTicksLimit: 6,
-              callback: function(value, index) {
-                return index % 10 === 0 ? this.getLabelForValue(value) : '';
-              }
-            },
-            grid: { color: "#1e293b" }
-          },
-          y: {
-            ticks: { color: "#94a3b8" },
-            grid: { color: "#1e293b" }
-          }
+          x: { ticks: { color: "#94a3b8", maxTicksLimit: 6 }, grid: { color: "#1e293b" } },
+          y: { ticks: { color: "#94a3b8" },                   grid: { color: "#1e293b" } }
         },
-        plugins: {
-          legend: { display: false }
-        },
-        animation: false
+        plugins: { legend: { display: false } }
       }
     });
   }
-  
+
   update() {
-    let data;
-    if (this.dataType === "frequency") data = dataStore.frequency;
-    else if (this.dataType === "snr") data = dataStore.snr;
-    else if (this.dataType === "accel") data = dataStore.accel;
-    
+    const data =
+      this.dataType === "frequency" ? dataStore.frequency :
+      this.dataType === "snr"       ? dataStore.snr       :
+                                      dataStore.accel;
     if (!data || data.length === 0) return;
-    
-    // Calculate time labels (seconds ago)
+
     const now = Date.now();
-    const labels = [];
-    const values = [];
-    
-    data.forEach(point => {
-      const secondsAgo = ((now - point.time) / 1000).toFixed(1);
-      labels.push(`-${secondsAgo}s`);
-      values.push(point.value);
-    });
-    
-    this.chart.data.labels = labels;
-    this.chart.data.datasets[0].data = values;
+    this.chart.data.labels              = data.map(p => `-${((now - p.time) / 1000).toFixed(1)}s`);
+    this.chart.data.datasets[0].data    = data.map(p => p.value);
     this.chart.update("none");
   }
 }
 
+// ---------------------------------------------------------------------------
 class WaveformWidget {
   constructor(element) {
-    this.element = element;
+    this.element  = element;
     this.dataType = "waveform";
-    
+
     element.innerHTML = `
       <div class="widget-header">
-        <span class="widget-title">Real-Time Waveform (2s)</span>
+        <span class="widget-title">Real-Time Waveform (2 s)</span>
         <span class="widget-close" onclick="removeWidget('${element.id}')">×</span>
       </div>
-      <div class="widget-chart" style="height: 300px;">
-        <canvas></canvas>
-      </div>
-    `;
-    
+      <div class="widget-chart" style="height:300px"><canvas></canvas></div>`;
+
     const ctx = element.querySelector("canvas").getContext("2d");
-    
     this.chart = new Chart(ctx, {
       type: "line",
       data: {
         labels: [],
         datasets: [
-          {
-            label: "Magnitude",
-            data: [],
-            borderColor: "#2196F3",
-            borderWidth: 2,
-            pointRadius: 0,
-            tension: 0.1
-          },
-          {
-            label: "Z-axis",
-            data: [],
-            borderColor: "#4CAF50",
-            borderWidth: 2,
-            pointRadius: 0,
-            tension: 0.1
-          }
+          { label: "Magnitude", data: [], borderColor: "#2196F3", borderWidth: 2, pointRadius: 0, tension: 0.1 },
+          { label: "Z-axis",    data: [], borderColor: "#4CAF50", borderWidth: 2, pointRadius: 0, tension: 0.1 }
         ]
       },
       options: {
-        responsive: true,
-        maintainAspectRatio: false,
+        responsive: true, maintainAspectRatio: false, animation: false,
         scales: {
-          x: {
-            ticks: { 
-              color: "#94a3b8", 
-              maxTicksLimit: 5,
-              callback: function(value, index) {
-                return index % 20 === 0 ? this.getLabelForValue(value) : '';
-              }
-            },
-            grid: { color: "#1e293b" }
-          },
-          y: {
-            ticks: { color: "#94a3b8" },
-            grid: { color: "#1e293b" }
-          }
+          x: { ticks: { color: "#94a3b8", maxTicksLimit: 5 }, grid: { color: "#1e293b" } },
+          y: { ticks: { color: "#94a3b8" },                   grid: { color: "#1e293b" } }
         },
-        plugins: {
-          legend: {
-            labels: { color: "#94a3b8" }
-          }
-        },
-        animation: false
+        plugins: { legend: { labels: { color: "#94a3b8" } } }
       }
     });
   }
-  
+
   update() {
     const wf = dataStore.waveform;
-    if (wf.time.length === 0) return;
-    
-    // Show last 2 seconds
-    const lastTime = wf.time[wf.time.length - 1];
-    const startTime = lastTime - 2;
-    
-    const labels = [];
-    const magData = [];
-    const zData = [];
-    
+    if (!wf.time || wf.time.length === 0) return;
+
+    const lastTime  = wf.time[wf.time.length - 1];
+    const startTime = lastTime - 2.0;   // show last 2 seconds
+
+    const labels = [], magData = [], zData = [];
     for (let i = 0; i < wf.time.length; i++) {
       if (wf.time[i] >= startTime) {
         labels.push((wf.time[i] - startTime).toFixed(2));
@@ -372,34 +335,34 @@ class WaveformWidget {
         zData.push(wf.z[i]);
       }
     }
-    
-    this.chart.data.labels = labels;
+
+    this.chart.data.labels           = labels;
     this.chart.data.datasets[0].data = magData;
     this.chart.data.datasets[1].data = zData;
     this.chart.update("none");
   }
 }
 
-// --- Widget Removal ---
+// ---------------------------------------------------------------------------
+// Widget Removal
+// ---------------------------------------------------------------------------
 function removeWidget(id) {
-  const widget = widgets[id];
-  if (widget && widget.chart) {
-    widget.chart.destroy();
-  }
+  const w = widgets[id];
+  if (w?.chart) w.chart.destroy();
   delete widgets[id];
-  document.getElementById(id).remove();
+  document.getElementById(id)?.remove();
 }
+window.removeWidget = removeWidget;
 
-// --- Draggable Logic ---
+// ---------------------------------------------------------------------------
+// Drag-within-canvas
+// ---------------------------------------------------------------------------
 function makeDraggable(div) {
-  let offsetX, offsetY;
-  let isDragging = false;
-
   const header = div.querySelector(".widget-header");
-  
+  let offsetX, offsetY, isDragging = false;
+
   header.onmousedown = (e) => {
     if (e.target.classList.contains("widget-close")) return;
-    
     isDragging = true;
     offsetX = e.offsetX;
     offsetY = e.offsetY;
@@ -409,17 +372,13 @@ function makeDraggable(div) {
       if (!isDragging) return;
       const rect = canvas.getBoundingClientRect();
       div.style.left = (ev.clientX - rect.left - offsetX) + "px";
-      div.style.top = (ev.clientY - rect.top - offsetY) + "px";
+      div.style.top  = (ev.clientY - rect.top  - offsetY) + "px";
     };
-
     document.onmouseup = () => {
       isDragging = false;
       div.style.cursor = "move";
       document.onmousemove = null;
-      document.onmouseup = null;
+      document.onmouseup  = null;
     };
   };
 }
-
-// Make removeWidget globally accessible
-window.removeWidget = removeWidget;
