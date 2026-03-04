@@ -51,3 +51,4 @@ class SNREstimator:
         snr_db = float(np.clip(snr_db, self.SNR_MIN, self.SNR_MAX))
 
         self.bus.publish(SNRMsg(t=msg.t, snr_db=snr_db))
+        

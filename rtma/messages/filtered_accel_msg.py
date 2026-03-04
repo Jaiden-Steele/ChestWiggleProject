@@ -1,13 +1,25 @@
+# rtma/messages/filtered_accel_msg.py
+import numpy as np
+
+
 class FilteredAccelMsg:
     """
-    Filtered acceleration sample (post digital filtering)
+    Carries the full filtered, projected acceleration window (numpy array).
+
+    to_dict() converts the array to a plain Python list so the ZMQ bridge
+    can JSON-serialise it without crashing.
     """
+
     def __init__(self, t, value):
-        self.t = t              # time in seconds
-        self.value = value      # filtered acceleration (g or m/s^2)
+        self.t     = float(t)
+        # Accept both numpy arrays and plain lists/scalars
+        self.value = value
 
     def to_dict(self):
-        return {
-            "t": self.t,
-            "value": self.value
-        }
+        v = self.value
+        # Convert numpy array → plain list for JSON serialisation
+        if isinstance(v, np.ndarray):
+            v = v.tolist()
+        elif hasattr(v, "tolist"):
+            v = v.tolist()
+        return {"t": self.t, "value": v}

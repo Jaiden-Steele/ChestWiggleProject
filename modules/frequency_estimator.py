@@ -28,7 +28,6 @@ class FrequencyEstimator:
         self._freq_history = deque(maxlen=5)   # median smoother window
         bus.subscribe(FilteredAccelMsg, self.on_filtered)
 
-    # ------------------------------------------------------------------
     def on_filtered(self, msg: FilteredAccelMsg):
         mag_filt = np.asarray(msg.value, dtype=float)
 

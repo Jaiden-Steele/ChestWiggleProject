@@ -1,351 +1,377 @@
-console.log("🔥 Dashboard JS loaded");
+// dashboard/public/dashboard.js
+// HFOV RTMA Clinical Dashboard
+//
+// Long-run robustness fixes:
+//   - All data stores use fixed-size circular (ring) buffers implemented
+//     as typed Float64Arrays + a head pointer.  Array.shift() at 100 Hz
+//     allocates O(N) garbage per tick and causes GC pauses — eliminated.
+//   - Chart updates are decoupled from WebSocket messages via
+//     requestAnimationFrame.  The browser is asked to render at most once
+//     per display frame (~60 Hz) regardless of incoming message rate.
+//   - Waveform ring buffer holds exactly 200 slots (2 s at 100 Hz).
+//     Trend ring buffers hold 300 slots each (enough for a 60-second view
+//     while keeping memory flat for the whole experiment).
+//   - DC removal uses an exponential moving average (α = 0.005) instead of
+//     a fixed-length rolling mean — constant time, constant memory.
+//   - No per-message DOM writes; only the RAF callback touches the DOM.
+//   - Fault watchdog: if no AccelMsg arrives for 3 s the banner goes red.
 
-// ---------------------------------------------------------------------------
-// WebSocket Connection
-// ---------------------------------------------------------------------------
-const ws = new WebSocket("ws://localhost:3000");
+"use strict";
 
-// ---------------------------------------------------------------------------
-// Data Store
-// ---------------------------------------------------------------------------
-const dataStore = {
-  frequency:   [],
-  snr:         [],
-  accel:       [],
-  waveform:    { time: [], ax: [], ay: [], az: [] }, // raw axes for DC removal
-  currentFreq: 0,
-  currentSNR:  -30,
+// ─── Ring Buffer ────────────────────────────────────────────────────────────
+class RingBuffer {
+  constructor(capacity) {
+    this.capacity = capacity;
+    this.data     = new Float64Array(capacity);
+    this.times    = new Float64Array(capacity); // wall-clock ms
+    this.head     = 0;   // index of the NEXT write position
+    this.count    = 0;   // number of valid entries (≤ capacity)
+  }
+
+  push(value, timeMs) {
+    this.data[this.head]  = value;
+    this.times[this.head] = timeMs;
+    this.head = (this.head + 1) % this.capacity;
+    if (this.count < this.capacity) this.count++;
+  }
+
+  /** Fill arrays `vals` and `tMs` with entries in chronological order. */
+  read(vals, tMs) {
+    const n    = this.count;
+    const cap  = this.capacity;
+    const start = this.count < cap ? 0 : this.head;
+    for (let i = 0; i < n; i++) {
+      const idx = (start + i) % cap;
+      vals[i] = this.data[idx];
+      tMs[i]  = this.times[idx];
+    }
+    return n;
+  }
+}
+
+// ─── Data Store ─────────────────────────────────────────────────────────────
+const TREND_CAP    = 300;   // ~60 s at 5 Hz
+const WAVEFORM_CAP = 200;   // 2 s at 100 Hz
+
+const store = {
+  freq:    new RingBuffer(TREND_CAP),
+  snr:     new RingBuffer(TREND_CAP),
+  accel:   new RingBuffer(TREND_CAP),
+  wfTime:  new Float64Array(WAVEFORM_CAP),   // monotonic seconds from Python
+  wfMag:   new Float64Array(WAVEFORM_CAP),
+  wfZ:     new Float64Array(WAVEFORM_CAP),
+  wfHead:  0,
+  wfCount: 0,
+
+  currentFreq:  0,
+  currentSNR:   -30,
   currentAccel: 0,
-  currentState: "normal",   // "normal" | "warning" | "fault"
-  maxPoints:   50           // trend history length
+  state:        0,    // 0 NORMAL | 1 LOW_SIGNAL | 2 FAULT
+  lastAccelMs:  Date.now(),
 };
 
-// Rolling mean accumulators for waveform DC removal (matches reference update_waveform)
-const DC_WINDOW = 200;
-const dcBuf = { ax: [], ay: [], az: [] };
+// Exponential moving average for DC removal (α≈0.005 ≈ 200-sample window)
+const DC_ALPHA = 0.005;
+const dc = { ax: null, ay: null, az: null };
 
-// ---------------------------------------------------------------------------
-// Widget Registry
-// ---------------------------------------------------------------------------
-const widgets = {};
+// ─── WebSocket ───────────────────────────────────────────────────────────────
+const ws = new WebSocket("ws://localhost:3000");
+ws.onopen  = () => setAlert(0, "✓ Connected to RTMA stream");
+ws.onerror = () => setAlert(2, "!! FAULT: CONNECTION ERROR !!");
+ws.onclose = () => setAlert(2, "!! FAULT: DISCONNECTED !!");
 
-// ---------------------------------------------------------------------------
-// WebSocket Handlers
-// ---------------------------------------------------------------------------
-ws.onopen = () => {
-  console.log("✅ WebSocket connected");
-  updateAlert("normal", "✓ Connected to RTMA stream");
-};
-
-ws.onmessage = (event) => {
-  const packet = JSON.parse(event.data);
+ws.onmessage = ({ data }) => {
+  let packet;
+  try { packet = JSON.parse(data); } catch { return; }
   const { topic, msg } = packet;
   const now = Date.now();
 
-  // --- Accelerometer raw data (waveform + DC accumulators) ---
   if (topic === "AccelMsg") {
-    // Accumulate for running mean (DC removal, same as reference)
-    for (const axis of ["ax", "ay", "az"]) {
-      dcBuf[axis].push(msg[axis]);
-      if (dcBuf[axis].length > DC_WINDOW) dcBuf[axis].shift();
-    }
+    store.lastAccelMs = now;
 
-    const meanAx = mean(dcBuf.ax);
-    const meanAy = mean(dcBuf.ay);
-    const meanAz = mean(dcBuf.az);
+    // EMA-based DC removal (gravity)
+    if (dc.ax === null) { dc.ax = msg.ax; dc.ay = msg.ay; dc.az = msg.az; }
+    dc.ax += DC_ALPHA * (msg.ax - dc.ax);
+    dc.ay += DC_ALPHA * (msg.ay - dc.ay);
+    dc.az += DC_ALPHA * (msg.az - dc.az);
 
-    const ax_ac = msg.ax - meanAx;
-    const ay_ac = msg.ay - meanAy;
-    const az_ac = msg.az - meanAz;
-    const mag   = Math.sqrt(ax_ac**2 + ay_ac**2 + az_ac**2);
+    const ax_ac = msg.ax - dc.ax;
+    const ay_ac = msg.ay - dc.ay;
+    const az_ac = msg.az - dc.az;
+    const mag   = Math.sqrt(ax_ac*ax_ac + ay_ac*ay_ac + az_ac*az_ac);
 
-    const t = msg.t ?? (now / 1000);
-    dataStore.waveform.time.push(t);
-    dataStore.waveform.mag  = dataStore.waveform.mag  ?? [];
-    dataStore.waveform.mag.push(mag);
-    dataStore.waveform.z   = dataStore.waveform.z    ?? [];
-    dataStore.waveform.z.push(az_ac);
-
-    if (dataStore.waveform.time.length > DC_WINDOW) {
-      dataStore.waveform.time.shift();
-      dataStore.waveform.mag.shift();
-      dataStore.waveform.z.shift();
-    }
-
-    updateWidgets("waveform");
+    const t   = msg.t ?? (now / 1000);
+    const idx = store.wfHead;
+    store.wfTime[idx] = t;
+    store.wfMag[idx]  = mag;
+    store.wfZ[idx]    = az_ac;
+    store.wfHead  = (store.wfHead  + 1) % WAVEFORM_CAP;
+    if (store.wfCount < WAVEFORM_CAP) store.wfCount++;
   }
 
-  // --- Filtered acceleration amplitude ---
   if (topic === "FilteredAccelMsg" && msg.value !== undefined) {
-    // value is now a scalar amplitude (std of filtered window, in mg)
-    dataStore.currentAccel = msg.value;
-    dataStore.accel.push({ time: now, value: msg.value });
-    if (dataStore.accel.length > dataStore.maxPoints) dataStore.accel.shift();
-    updateWidgets("accel");
+    store.currentAccel = msg.value;
+    store.accel.push(msg.value, now);
   }
 
-  // --- Estimated frequency ---
   if (topic === "FrequencyMsg" && msg.f_hz !== undefined) {
-    dataStore.currentFreq = msg.f_hz;
-    dataStore.frequency.push({ time: now, value: msg.f_hz });
-    if (dataStore.frequency.length > dataStore.maxPoints) dataStore.frequency.shift();
-    updateWidgets("frequency");
+    store.currentFreq = msg.f_hz;
+    store.freq.push(msg.f_hz, now);
   }
 
-  // --- Reference frequency (also feed the frequency trend) ---
-  if (topic === "ReferenceFreqMsg" && msg.f_ref !== undefined) {
-    dataStore.frequency.push({ time: now, value: msg.f_ref });
-    if (dataStore.frequency.length > dataStore.maxPoints) dataStore.frequency.shift();
-    updateWidgets("frequency");
-  }
-
-  // --- SNR ---
   if (topic === "SNRMsg" && msg.snr_db !== undefined) {
-    dataStore.currentSNR = msg.snr_db;
-    dataStore.snr.push({ time: now, value: msg.snr_db });
-    if (dataStore.snr.length > dataStore.maxPoints) dataStore.snr.shift();
-    updateWidgets("snr");
+    store.currentSNR = msg.snr_db;
+    store.snr.push(msg.snr_db, now);
   }
 
-  // --- State from StateMonitor (authoritative) ---
   if (topic === "StateMsg" && msg.state !== undefined) {
-    // 0 = NORMAL, 1 = LOW_SIGNAL, 2 = FAULT  (matches state_monitor.py constants)
-    const stateMap = {
-      0: { css: "normal",  text: "✓ SYSTEM NORMAL — Monitoring Active" },
-      1: { css: "warning", text: "⚠ WARNING: LOW SIGNAL QUALITY" },
-      2: { css: "fault",   text: "!! FAULT: NO DATA !!" }
-    };
-    const s = stateMap[msg.state] ?? stateMap[0];
-    dataStore.currentState = s.css;
-    updateAlert(s.css, s.text);
+    store.state = msg.state;
   }
 };
 
-ws.onerror = () => {
-  updateAlert("fault", "!! FAULT: CONNECTION ERROR !!");
-};
+// ─── Fault watchdog (3 s, runs independently of WS) ─────────────────────────
+setInterval(() => {
+  if (Date.now() - store.lastAccelMs > 3000) {
+    setAlert(2, "!! FAULT: NO DATA !!");
+  }
+}, 1000);
 
-ws.onclose = () => {
-  updateAlert("fault", "!! FAULT: NO DATA !!");
-};
+// ─── Alert Banner ────────────────────────────────────────────────────────────
+const ALERT_CFG = [
+  { css: "alert-normal",  text: "✓ SYSTEM NORMAL — Monitoring Active" },
+  { css: "alert-warning", text: "⚠ WARNING: LOW SIGNAL QUALITY" },
+  { css: "alert-fault",   text: "!! FAULT: NO DATA !!" },
+];
+let _lastAlertState = -1;
+let _customAlert    = null;
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-function mean(arr) {
-  return arr.length === 0 ? 0 : arr.reduce((a, b) => a + b, 0) / arr.length;
+function setAlert(state, customText) {
+  _customAlert = customText ?? null;
+  if (state !== _lastAlertState || customText) {
+    const banner = document.getElementById("alertBanner");
+    const cfg    = ALERT_CFG[state] ?? ALERT_CFG[0];
+    banner.className   = `alert-banner ${cfg.css}`;
+    banner.textContent = customText ?? cfg.text;
+    _lastAlertState = state;
+  }
 }
 
-// ---------------------------------------------------------------------------
-// Alert Banner
-// ---------------------------------------------------------------------------
-function updateAlert(state, message) {
-  const banner = document.getElementById("alertBanner");
-  banner.textContent = message;
-  banner.className = `alert-banner alert-${state}`;
-}
+// ─── Widget Registry ─────────────────────────────────────────────────────────
+const widgets = {};
 
-// ---------------------------------------------------------------------------
-// Widget Update Dispatch
-// ---------------------------------------------------------------------------
-function updateWidgets(dataType) {
-  Object.values(widgets).forEach(w => {
-    if (w.dataType === dataType) w.update();
+// ─── requestAnimationFrame render loop ───────────────────────────────────────
+let _rafPending = false;
+function scheduleRender() {
+  if (_rafPending) return;
+  _rafPending = true;
+  requestAnimationFrame(() => {
+    _rafPending = false;
+    // Sync alert banner with authoritative state
+    if (_customAlert === null) setAlert(store.state);
+    // Update all widgets
+    Object.values(widgets).forEach(w => { try { w.render(); } catch {} });
   });
 }
 
-// ---------------------------------------------------------------------------
-// Drag-and-Drop onto Canvas
-// ---------------------------------------------------------------------------
-const canvas = document.getElementById("canvas");
+// Kick the render loop at ~30 Hz independent of data arrival
+setInterval(scheduleRender, 33);
+
+// ─── Drag-and-drop canvas ────────────────────────────────────────────────────
+const canvasEl = document.getElementById("canvas");
 
 document.querySelectorAll(".tool").forEach(tool => {
   tool.addEventListener("dragstart", e => {
     e.dataTransfer.setData("widgetType", tool.dataset.widget);
   });
 });
-
-canvas.addEventListener("dragover", e => e.preventDefault());
-
-canvas.addEventListener("drop", e => {
+canvasEl.addEventListener("dragover", e => e.preventDefault());
+canvasEl.addEventListener("drop", e => {
   e.preventDefault();
   const type = e.dataTransfer.getData("widgetType");
-  const rect  = canvas.getBoundingClientRect();
+  const rect = canvasEl.getBoundingClientRect();
   createWidget(type, e.clientX - rect.left, e.clientY - rect.top);
 });
 
-// ---------------------------------------------------------------------------
-// Widget Factory
-// ---------------------------------------------------------------------------
+// ─── Widget Factory ───────────────────────────────────────────────────────────
 function createWidget(type, x, y) {
   const id  = crypto.randomUUID();
   const div = document.createElement("div");
-  div.className = "widget";
-  div.id        = id;
-  div.style.left = x + "px";
-  div.style.top  = y + "px";
+  div.className  = "widget";
+  div.id         = id;
+  div.style.left = `${Math.max(0, x)}px`;
+  div.style.top  = `${Math.max(0, y)}px`;
 
-  let widget;
+  let w;
   switch (type) {
-    case "frequency-value":
-      widget = new ValueWidget(div, "Frequency",       "frequency", " Hz", "#60a5fa"); break;
-    case "snr-value":
-      widget = new ValueWidget(div, "SNR",             "snr",       " dB", "#10b981"); break;
-    case "accel-value":
-      widget = new ValueWidget(div, "Filtered Accel",  "accel",     " mg", "#f59e0b"); break;
-    case "frequency-trend":
-      widget = new TrendWidget(div, "Frequency (10s)", "frequency", "Hz",  "#60a5fa"); break;
-    case "snr-trend":
-      widget = new TrendWidget(div, "SNR (10s)",       "snr",       "dB",  "#10b981"); break;
-    case "waveform":
-      widget = new WaveformWidget(div); break;
+    case "frequency-value":  w = new ValueWidget(div, "Frequency",      "freq",  " Hz", "#60a5fa"); break;
+    case "snr-value":        w = new ValueWidget(div, "SNR",            "snr",   " dB", "#10b981"); break;
+    case "accel-value":      w = new ValueWidget(div, "Amplitude",      "accel", " mg", "#f59e0b"); break;
+    case "frequency-trend":  w = new TrendWidget(div, "Frequency (60s)","freq",  "Hz",  "#60a5fa"); break;
+    case "snr-trend":        w = new TrendWidget(div, "SNR (60s)",      "snr",   "dB",  "#10b981"); break;
+    case "waveform":         w = new WaveformWidget(div); break;
     default: return;
   }
 
-  widgets[id] = widget;
+  widgets[id] = w;
   makeDraggable(div);
-  canvas.appendChild(div);
-  widget.update();
+  canvasEl.appendChild(div);
 }
 
-// ---------------------------------------------------------------------------
-// Widget Classes
-// ---------------------------------------------------------------------------
+// ─── Widget Base ─────────────────────────────────────────────────────────────
+function widgetHeader(id, title) {
+  return `<div class="widget-header">
+    <span class="widget-title">${title}</span>
+    <span class="widget-close" onclick="removeWidget('${id}')">×</span>
+  </div>`;
+}
+
+// ─── ValueWidget ─────────────────────────────────────────────────────────────
 class ValueWidget {
-  constructor(element, title, dataType, unit, color) {
-    this.element  = element;
-    this.dataType = dataType;
+  constructor(el, title, storeKey, unit, color) {
+    this.el       = el;
+    this.storeKey = storeKey;
     this.unit     = unit;
-
-    element.innerHTML = `
-      <div class="widget-header">
-        <span class="widget-title">${title}</span>
-        <span class="widget-close" onclick="removeWidget('${element.id}')">×</span>
-      </div>
-      <div class="widget-value" style="color:${color}">--</div>`;
-
-    this.valueEl = element.querySelector(".widget-value");
+    el.innerHTML  = `${widgetHeader(el.id, title)}
+      <div class="value-display" style="color:${color}">--</div>`;
+    this.display = el.querySelector(".value-display");
   }
-
-  update() {
-    const v =
-      this.dataType === "frequency" ? dataStore.currentFreq  :
-      this.dataType === "snr"       ? dataStore.currentSNR   :
-                                      dataStore.currentAccel;
-    this.valueEl.textContent = (typeof v === "number" ? v.toFixed(2) : "--") + this.unit;
+  render() {
+    const v = store[`current${this.storeKey.charAt(0).toUpperCase() + this.storeKey.slice(1)}`];
+    this.display.textContent = typeof v === "number"
+      ? v.toFixed(2) + this.unit
+      : "--";
   }
 }
 
-// ---------------------------------------------------------------------------
-class TrendWidget {
-  constructor(element, title, dataType, yLabel, color) {
-    this.element  = element;
-    this.dataType = dataType;
+// ─── TrendWidget ──────────────────────────────────────────────────────────────
+// Pre-allocated scratch arrays to avoid per-render allocations
+const _tScratch = new Float64Array(TREND_CAP);
+const _vScratch = new Float64Array(TREND_CAP);
 
-    element.innerHTML = `
-      <div class="widget-header">
-        <span class="widget-title">${title}</span>
-        <span class="widget-close" onclick="removeWidget('${element.id}')">×</span>
-      </div>
+class TrendWidget {
+  constructor(el, title, storeKey, yLabel, color) {
+    this.storeKey = storeKey;
+    el.innerHTML  = `${widgetHeader(el.id, title)}
       <div class="widget-chart"><canvas></canvas></div>`;
 
-    const ctx = element.querySelector("canvas").getContext("2d");
+    const ctx = el.querySelector("canvas").getContext("2d");
     this.chart = new Chart(ctx, {
       type: "line",
       data: {
         labels: [],
         datasets: [{
           label: yLabel, data: [],
-          borderColor: color, backgroundColor: color + "33",
-          borderWidth: 2, tension: 0.4, fill: true,
-          pointRadius: 2, pointBackgroundColor: color
+          borderColor: color, backgroundColor: color + "22",
+          borderWidth: 2, tension: 0.3, fill: true,
+          pointRadius: 0,
         }]
       },
       options: {
         responsive: true, maintainAspectRatio: false, animation: false,
         scales: {
-          x: { ticks: { color: "#94a3b8", maxTicksLimit: 6 }, grid: { color: "#1e293b" } },
-          y: { ticks: { color: "#94a3b8" },                   grid: { color: "#1e293b" } }
+          x: { ticks: { color: "#64748b", maxTicksLimit: 5, font: { size: 10 } },
+               grid:  { color: "#1e293b" } },
+          y: { ticks: { color: "#94a3b8", font: { size: 11 } },
+               grid:  { color: "#1e293b" } }
         },
-        plugins: { legend: { display: false } }
+        plugins: { legend: { display: false } },
+        elements: { line: { borderCapStyle: "round" } }
       }
     });
   }
 
-  update() {
-    const data =
-      this.dataType === "frequency" ? dataStore.frequency :
-      this.dataType === "snr"       ? dataStore.snr       :
-                                      dataStore.accel;
-    if (!data || data.length === 0) return;
+  render() {
+    const ring = store[this.storeKey];
+    const n    = ring.read(_vScratch, _tScratch);
+    if (n === 0) return;
 
-    const now = Date.now();
-    this.chart.data.labels              = data.map(p => `-${((now - p.time) / 1000).toFixed(1)}s`);
-    this.chart.data.datasets[0].data    = data.map(p => p.value);
+    const now    = Date.now();
+    const labels = new Array(n);
+    const vals   = new Array(n);
+    for (let i = 0; i < n; i++) {
+      labels[i] = `-${((now - _tScratch[i]) / 1000).toFixed(0)}s`;
+      vals[i]   = _vScratch[i];
+    }
+
+    this.chart.data.labels           = labels;
+    this.chart.data.datasets[0].data = vals;
     this.chart.update("none");
   }
 }
 
-// ---------------------------------------------------------------------------
+// ─── WaveformWidget ───────────────────────────────────────────────────────────
+// Pre-allocated scratch arrays
+const _wfT   = new Float64Array(WAVEFORM_CAP);
+const _wfMag = new Float64Array(WAVEFORM_CAP);
+const _wfZ   = new Float64Array(WAVEFORM_CAP);
+
 class WaveformWidget {
-  constructor(element) {
-    this.element  = element;
+  constructor(el) {
     this.dataType = "waveform";
+    el.innerHTML  = `${widgetHeader(el.id, "Real-Time Waveform (2 s)")}
+      <div class="widget-chart" style="height:260px"><canvas></canvas></div>`;
 
-    element.innerHTML = `
-      <div class="widget-header">
-        <span class="widget-title">Real-Time Waveform (2 s)</span>
-        <span class="widget-close" onclick="removeWidget('${element.id}')">×</span>
-      </div>
-      <div class="widget-chart" style="height:300px"><canvas></canvas></div>`;
-
-    const ctx = element.querySelector("canvas").getContext("2d");
+    const ctx = el.querySelector("canvas").getContext("2d");
     this.chart = new Chart(ctx, {
       type: "line",
       data: {
         labels: [],
         datasets: [
-          { label: "Magnitude", data: [], borderColor: "#2196F3", borderWidth: 2, pointRadius: 0, tension: 0.1 },
-          { label: "Z-axis",    data: [], borderColor: "#4CAF50", borderWidth: 2, pointRadius: 0, tension: 0.1 }
+          { label: "Magnitude", data: [], borderColor: "#3b82f6",
+            borderWidth: 2, pointRadius: 0, tension: 0.1 },
+          { label: "Z-axis",    data: [], borderColor: "#22c55e",
+            borderWidth: 1.5, pointRadius: 0, tension: 0.1, borderDash: [4,2] }
         ]
       },
       options: {
         responsive: true, maintainAspectRatio: false, animation: false,
         scales: {
-          x: { ticks: { color: "#94a3b8", maxTicksLimit: 5 }, grid: { color: "#1e293b" } },
-          y: { ticks: { color: "#94a3b8" },                   grid: { color: "#1e293b" } }
+          x: { ticks: { color: "#64748b", maxTicksLimit: 5, font: { size: 10 } },
+               grid:  { color: "#1e293b" } },
+          y: { ticks: { color: "#94a3b8", font: { size: 11 } },
+               grid:  { color: "#1e293b" } }
         },
-        plugins: { legend: { labels: { color: "#94a3b8" } } }
+        plugins: {
+          legend: { labels: { color: "#94a3b8", boxWidth: 12, font: { size: 11 } } }
+        }
       }
     });
   }
 
-  update() {
-    const wf = dataStore.waveform;
-    if (!wf.time || wf.time.length === 0) return;
+  render() {
+    const n = store.wfCount;
+    if (n === 0) return;
 
-    const lastTime  = wf.time[wf.time.length - 1];
-    const startTime = lastTime - 2.0;   // show last 2 seconds
+    // Read ring buffer in chronological order into scratch arrays
+    const cap   = WAVEFORM_CAP;
+    const start = n < cap ? 0 : store.wfHead;
+    for (let i = 0; i < n; i++) {
+      const idx  = (start + i) % cap;
+      _wfT[i]   = store.wfTime[idx];
+      _wfMag[i] = store.wfMag[idx];
+      _wfZ[i]   = store.wfZ[idx];
+    }
 
-    const labels = [], magData = [], zData = [];
-    for (let i = 0; i < wf.time.length; i++) {
-      if (wf.time[i] >= startTime) {
-        labels.push((wf.time[i] - startTime).toFixed(2));
-        magData.push(wf.mag[i]);
-        zData.push(wf.z[i]);
+    const tEnd   = _wfT[n - 1];
+    const tStart = tEnd - 2.0;
+
+    const labels = [], mag = [], z = [];
+    for (let i = 0; i < n; i++) {
+      if (_wfT[i] >= tStart) {
+        labels.push((_wfT[i] - tStart).toFixed(2));
+        mag.push(_wfMag[i]);
+        z.push(_wfZ[i]);
       }
     }
 
     this.chart.data.labels           = labels;
-    this.chart.data.datasets[0].data = magData;
-    this.chart.data.datasets[1].data = zData;
+    this.chart.data.datasets[0].data = mag;
+    this.chart.data.datasets[1].data = z;
     this.chart.update("none");
   }
 }
 
-// ---------------------------------------------------------------------------
-// Widget Removal
-// ---------------------------------------------------------------------------
+// ─── Widget Removal ───────────────────────────────────────────────────────────
 function removeWidget(id) {
   const w = widgets[id];
   if (w?.chart) w.chart.destroy();
@@ -354,31 +380,29 @@ function removeWidget(id) {
 }
 window.removeWidget = removeWidget;
 
-// ---------------------------------------------------------------------------
-// Drag-within-canvas
-// ---------------------------------------------------------------------------
+// ─── Drag inside canvas ───────────────────────────────────────────────────────
 function makeDraggable(div) {
   const header = div.querySelector(".widget-header");
-  let offsetX, offsetY, isDragging = false;
+  let ox = 0, oy = 0, dragging = false;
 
-  header.onmousedown = (e) => {
+  header.addEventListener("mousedown", (e) => {
     if (e.target.classList.contains("widget-close")) return;
-    isDragging = true;
-    offsetX = e.offsetX;
-    offsetY = e.offsetY;
+    dragging = true;
+    ox = e.clientX - div.offsetLeft;
+    oy = e.clientY - div.offsetTop;
     div.style.cursor = "grabbing";
+    e.preventDefault();
+  });
 
-    document.onmousemove = (ev) => {
-      if (!isDragging) return;
-      const rect = canvas.getBoundingClientRect();
-      div.style.left = (ev.clientX - rect.left - offsetX) + "px";
-      div.style.top  = (ev.clientY - rect.top  - offsetY) + "px";
-    };
-    document.onmouseup = () => {
-      isDragging = false;
-      div.style.cursor = "move";
-      document.onmousemove = null;
-      document.onmouseup  = null;
-    };
-  };
+  document.addEventListener("mousemove", (e) => {
+    if (!dragging) return;
+    div.style.left = `${e.clientX - ox}px`;
+    div.style.top  = `${e.clientY - oy}px`;
+  });
+
+  document.addEventListener("mouseup", () => {
+    if (!dragging) return;
+    dragging = false;
+    div.style.cursor = "move";
+  });
 }
