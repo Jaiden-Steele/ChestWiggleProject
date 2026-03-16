@@ -226,6 +226,9 @@ function widgetHeader(id, title) {
 }
 
 // ─── ValueWidget ─────────────────────────────────────────────────────────────
+// Explicit lookup avoids capitalisation bug: "snr" → "currentSnr" ≠ "currentSNR"
+const VALUE_KEY_MAP = { freq: "currentFreq", snr: "currentSNR", accel: "currentAccel" };
+
 class ValueWidget {
   constructor(el, title, storeKey, unit, color) {
     this.el       = el;
@@ -236,7 +239,7 @@ class ValueWidget {
     this.display = el.querySelector(".value-display");
   }
   render() {
-    const v = store[`current${this.storeKey.charAt(0).toUpperCase() + this.storeKey.slice(1)}`];
+    const v = store[VALUE_KEY_MAP[this.storeKey]];
     this.display.textContent = typeof v === "number"
       ? v.toFixed(2) + this.unit
       : "--";
@@ -285,11 +288,12 @@ class TrendWidget {
     const n    = ring.read(_vScratch, _tScratch);
     if (n === 0) return;
 
-    const now    = Date.now();
+    // Show elapsed time from oldest sample (0s) to newest (up to 60s)
+    const t0     = _tScratch[0];
     const labels = new Array(n);
     const vals   = new Array(n);
     for (let i = 0; i < n; i++) {
-      labels[i] = `-${((now - _tScratch[i]) / 1000).toFixed(0)}s`;
+      labels[i] = `${((_tScratch[i] - t0) / 1000).toFixed(0)}s`;
       vals[i]   = _vScratch[i];
     }
 

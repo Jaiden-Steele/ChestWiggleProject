@@ -174,6 +174,67 @@
       height: 200px;
       position: relative;
     }
+
+    /* ── Reference Frequency Control ── */
+    .ref-freq-control {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 6px;
+      padding: 5px 12px;
+      margin-left: auto;   /* push to right end of toolbar */
+    }
+    .ref-freq-control label {
+      font-size: 0.78rem;
+      font-weight: 700;
+      color: #64748b;
+      text-transform: uppercase;
+      letter-spacing: 0.07em;
+      white-space: nowrap;
+    }
+    .ref-freq-input {
+      width: 70px;
+      background: #0f1a2e;
+      border: 1px solid #334155;
+      border-radius: 4px;
+      color: #60a5fa;
+      font-size: 1rem;
+      font-weight: 700;
+      text-align: center;
+      padding: 3px 6px;
+      font-variant-numeric: tabular-nums;
+    }
+    .ref-freq-input:focus {
+      outline: none;
+      border-color: #60a5fa;
+    }
+    .ref-freq-unit {
+      font-size: 0.82rem;
+      color: #475569;
+    }
+    .ref-freq-btn {
+      background: #1d4e89;
+      border: none;
+      border-radius: 4px;
+      color: #e2e8f0;
+      font-size: 0.82rem;
+      font-weight: 600;
+      padding: 4px 10px;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+    .ref-freq-btn:hover  { background: #2e75b6; }
+    .ref-freq-btn:active { background: #1a3a5c; }
+    .ref-freq-confirm {
+      font-size: 0.75rem;
+      color: #10b981;
+      min-width: 40px;
+      opacity: 0;
+      transition: opacity 0.3s;
+    }
+    .ref-freq-confirm.show { opacity: 1; }
   </style>
 </head>
 <body>
@@ -192,6 +253,15 @@
     <div class="tool" draggable="true" data-widget="frequency-trend">📈 Freq Trend</div>
     <div class="tool" draggable="true" data-widget="snr-trend">📉 SNR Trend</div>
     <div class="tool" draggable="true" data-widget="waveform">〰️ Waveform</div>
+
+    <div class="ref-freq-control">
+      <label>Ref Freq</label>
+      <input  id="refFreqInput" class="ref-freq-input" type="number"
+              min="1" max="30" step="0.5" value="10.0">
+      <span class="ref-freq-unit">Hz</span>
+      <button class="ref-freq-btn" onclick="sendRefFreq()">Set</button>
+      <span   id="refFreqConfirm" class="ref-freq-confirm">✓ Set</span>
+    </div>
   </div>
 
   <div id="canvas">
@@ -211,10 +281,26 @@
       document.getElementById("runtime").textContent = `Runtime: ${h}:${m}:${sc}`;
     }, 1000);
 
+    // Reference frequency — send to Python via WebSocket → ZMQ PUSH
+    function sendRefFreq() {
+      const input  = document.getElementById("refFreqInput");
+      const f_ref  = parseFloat(input.value);
+      if (isNaN(f_ref) || f_ref <= 0) return;
+
+      ws.send(JSON.stringify({ topic: "SetReferenceFreq", f_ref }));
+
+      // Flash confirmation
+      const confirm = document.getElementById("refFreqConfirm");
+      confirm.classList.add("show");
+      setTimeout(() => confirm.classList.remove("show"), 1500);
+    }
+
+    // Allow pressing Enter in the input box
+    document.getElementById("refFreqInput")
+      .addEventListener("keydown", e => { if (e.key === "Enter") sendRefFreq(); });
+
     // Hide the canvas hint once the first widget is dropped
     const _canvasHint = document.getElementById("canvas-hint");
-    const _origCreate = window.createWidget;
-    // (dashboard.js defines createWidget; we patch it after it loads)
     document.addEventListener("drop", () => {
       if (_canvasHint) _canvasHint.style.display = "none";
     }, { once: true });

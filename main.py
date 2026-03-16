@@ -20,7 +20,7 @@ from loggers.frequency_error_logger import FrequencyErrorLogger
 from loggers.snr_logger import SNRLogger
 
 bus = RTMABus()
-bridge = RTMAZMQBridge(bus, addr="tcp://*:5555")
+bridge = RTMAZMQBridge(bus, pub_addr="tcp://*:5555")
 
 #  Modules 
 acq = AccelAcq(bus)
@@ -30,7 +30,7 @@ SNREstimator(fs=100, bus=bus)
 FrequencyErrorCalculator(bus)
 
 # Reference frequency source
-ref_freq = ReferenceFrequency(f_ref=10.0)
+ref_freq = ReferenceFrequency(bus, f_ref=7.5)  # Hz — can call ref_freq.set_reference(new_f) at runtime to update
 
 #  Loggers (verification artifacts) 
 FrequencyErrorLogger(bus, "frequency_error.csv")
@@ -45,7 +45,7 @@ try:
     while True:
         t = time.time()
         acq.poll()
-        bus.publish(ref_freq.update(t))
+        ref_freq.update(t)
         time.sleep(0.001)
 
 except KeyboardInterrupt:
